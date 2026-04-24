@@ -1,4 +1,4 @@
-# Detección de puntos con cámara + regresión lineal
+# Detección de puntos con cámara + regresión lineal 
 
 Este proyecto usa una cámara web para detectar puntos rojos en tiempo real (sobre una hoja blanca) y ajustar una recta por regresión lineal con esos puntos.
 

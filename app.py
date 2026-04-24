@@ -82,6 +82,50 @@ def linear_regression(points: np.ndarray) -> tuple[float, float] | None:
     return float(slope), float(intercept)
 
 
+def least_squares_regression(points: np.ndarray) -> tuple[float, float] | None:
+    if len(points) < 2:
+        return None
+
+    x = points[:, 0].astype(np.float64)
+    y = points[:, 1].astype(np.float64)
+
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if len(x) < 2:
+        return None
+
+    unique_x = np.unique(x)
+    if len(unique_x) < 2:
+        return None
+
+    # Ajuste y = m*x + b por minimos cuadrados con matriz de diseno.
+    design = np.column_stack((x, np.ones_like(x)))
+    try:
+        solution, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    slope = float(solution[0])
+    intercept = float(solution[1])
+
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+
+    return slope, intercept
+
+
+AVAILABLE_METHODS = ("polyfit", "least_squares")
+
+
+def fit_line(points: np.ndarray, method: str) -> tuple[float, float] | None:
+    if method == "polyfit":
+        return linear_regression(points)
+    if method == "least_squares":
+        return least_squares_regression(points)
+    raise ValueError(f"Metodo de regresion no soportado: {method}")
+
+
 def draw_regression_line(frame: np.ndarray, slope: float, intercept: float) -> None:
     height, width = frame.shape[:2]
 
@@ -92,7 +136,13 @@ def draw_regression_line(frame: np.ndarray, slope: float, intercept: float) -> N
     cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
 
-def save_regression_plot(points: np.ndarray, slope: float, intercept: float, output_path: str) -> None:
+def save_regression_plot(
+    points: np.ndarray,
+    slope: float,
+    intercept: float,
+    output_path: str,
+    method_label: str,
+) -> None:
     x = points[:, 0].astype(np.float64)
     y = points[:, 1].astype(np.float64)
 
@@ -101,10 +151,10 @@ def save_regression_plot(points: np.ndarray, slope: float, intercept: float, out
 
     plt.figure(figsize=(8, 5))
     plt.scatter(x, y, color="royalblue", label="Puntos detectados")
-    plt.plot(x_line, y_line, color="crimson", label="Regresión lineal")
+    plt.plot(x_line, y_line, color="crimson", label=f"Regresion lineal ({method_label})")
     plt.xlabel("X (pixeles)")
     plt.ylabel("Y (pixeles)")
-    plt.title("Regresión lineal a partir de puntos detectados")
+    plt.title(f"Regresion lineal ({method_label}) a partir de puntos detectados")
     plt.legend()
     plt.grid(alpha=0.25)
     plt.tight_layout()
@@ -119,6 +169,7 @@ def save_grbl_line_gcode(
     output_path: str,
     mm_per_pixel: float,
     feed_rate: float,
+    method_label: str,
 ) -> None:
     x = points[:, 0].astype(np.float64)
     if len(x) < 2:
@@ -137,7 +188,7 @@ def save_grbl_line_gcode(
     y2_mm = (y_max_px - y_min_px) * mm_per_pixel
 
     gcode_lines = [
-        "; Generado por app.py - recta por regresion lineal",
+        f"; Generado por app.py - recta por regresion lineal ({method_label})",
         "G21",  # mm
         "G90",  # coordenadas absolutas
         "G17",  # plano XY
@@ -329,6 +380,12 @@ def main() -> None:
         action="store_true",
         help="No envia el G-code al Arduino automaticamente al presionar g.",
     )
+    parser.add_argument(
+        "--method",
+        choices=AVAILABLE_METHODS,
+        default="polyfit",
+        help="Metodo de regresion para ajustar la recta.",
+    )
     args = parser.parse_args()
 
     if args.scan_cameras:
@@ -361,7 +418,10 @@ def main() -> None:
     print("Controles:")
     print("- g: guardar grafica (PNG), generar G-code y enviarlo a GRBL")
     print("- c: cambiar a la siguiente camara disponible")
+    print("- m: cambiar metodo de regresion")
     print("- q: salir")
+
+    current_method = args.method
 
     while True:
         ret, frame = cap.read()
@@ -372,7 +432,7 @@ def main() -> None:
         points = detect_red_points(frame)
 
         slope = intercept = None
-        fit = linear_regression(points)
+        fit = fit_line(points, current_method)
         if fit is not None:
             slope, intercept = fit
             draw_regression_line(frame, slope, intercept)
@@ -387,6 +447,17 @@ def main() -> None:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            f"Metodo: {current_method}",
+            (10, 115),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (180, 255, 180),
             2,
             cv2.LINE_AA,
         )
@@ -434,10 +505,16 @@ def main() -> None:
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("g"):
-            fit = linear_regression(points)
+            fit = fit_line(points, current_method)
             if fit is not None:
                 slope, intercept = fit
-                save_regression_plot(points, slope, intercept, "regression_plot.png")
+                save_regression_plot(
+                    points,
+                    slope,
+                    intercept,
+                    "regression_plot.png",
+                    method_label=current_method,
+                )
                 print("Grafica guardada en regression_plot.png")
                 try:
                     save_grbl_line_gcode(
@@ -447,6 +524,7 @@ def main() -> None:
                         output_path=args.gcode_output,
                         mm_per_pixel=max(1e-9, args.mm_per_pixel),
                         feed_rate=max(1.0, args.feed_rate),
+                        method_label=current_method,
                     )
                     print(f"G-code GRBL guardado en {args.gcode_output}")
 
@@ -463,6 +541,11 @@ def main() -> None:
                     print(f"No se pudo generar G-code: {error}")
             else:
                 print("No se pudo calcular una regresion estable con los puntos actuales.")
+        elif key == ord("m"):
+            current_index = AVAILABLE_METHODS.index(current_method)
+            next_index = (current_index + 1) % len(AVAILABLE_METHODS)
+            current_method = AVAILABLE_METHODS[next_index]
+            print(f"Metodo de regresion activo: {current_method}")
         elif key == ord("c"):
             if not available_camera_indices:
                 available_camera_indices = scan_available_cameras(max_index=max(0, args.max_camera_index))

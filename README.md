@@ -2,6 +2,11 @@
 
 Este proyecto usa una cámara web para detectar puntos rojos en tiempo real (sobre una hoja blanca) y ajustar una recta por regresión lineal con esos puntos.
 
+Metodos disponibles de ajuste:
+
+- `polyfit`: ajuste lineal usando `numpy.polyfit`
+- `least_squares`: ajuste lineal por minimos cuadrados con `numpy.linalg.lstsq`
+
 ## Requisitos
 
 - Python 3.10+
@@ -17,6 +22,12 @@ pip install -r requirements.txt
 
 ```bash
 python app.py
+```
+
+Para elegir el metodo de regresion al iniciar:
+
+```bash
+python app.py --method least_squares
 ```
 
 Para indicar una cámara específica:
@@ -42,6 +53,7 @@ python app.py --scan-cameras --max-camera-index 10
 	- G-code compatible con GRBL en `regression_line.nc`
 	- envio automatico al Arduino con GRBL (serial)
 - `c`: cambia a la siguiente cámara disponible
+- `m`: cambia entre metodos de regresion disponibles
 - `q`: cierra la aplicación
 
 ## Exportar para CNC (GRBL en Arduino)

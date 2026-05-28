@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -15,7 +16,8 @@ except ImportError:
     list_ports = None
 
 
-AVAILABLE_METHODS = ("polyfit", "least_squares")
+AVAILABLE_METHODS = ("polyfit", "least_squares", "gradient_descent")
+
 
 
 # ============================================================
@@ -289,11 +291,232 @@ def least_squares_regression(points_mm: np.ndarray) -> tuple[float, float] | Non
     return slope, intercept
 
 
+def gradient_descent_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
+    if len(points_mm) < 2:
+        return None
+
+    x = points_mm[:, 0].astype(np.float64)
+    y = points_mm[:, 1].astype(np.float64)
+
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if len(x) < 2:
+        return None
+
+    unique_x = np.unique(x)
+    if len(unique_x) < 2:
+        return None
+
+    x_mean = float(np.mean(x))
+    x_std = float(np.std(x))
+
+    if not np.isfinite(x_mean) or not np.isfinite(x_std) or x_std < 1e-12:
+        return None
+
+    x_normalized = (x - x_mean) / x_std
+
+    slope_normalized = 0.0
+    intercept_normalized = float(np.mean(y))
+    learning_rate = 0.05
+    iterations = 8000
+    previous_loss = np.inf
+
+    for _ in range(iterations):
+        y_pred = slope_normalized * x_normalized + intercept_normalized
+        error = y_pred - y
+        loss = float(np.mean(error * error))
+
+        if not np.isfinite(loss):
+            return None
+
+        if abs(previous_loss - loss) < 1e-12:
+            break
+
+        previous_loss = loss
+
+        gradient_slope = float(2.0 * np.mean(error * x_normalized))
+        gradient_intercept = float(2.0 * np.mean(error))
+
+        slope_normalized -= learning_rate * gradient_slope
+        intercept_normalized -= learning_rate * gradient_intercept
+
+        if not np.isfinite(slope_normalized) or not np.isfinite(intercept_normalized):
+            return None
+
+    slope = slope_normalized / x_std
+    intercept = intercept_normalized - slope * x_mean
+
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+
+    return float(slope), float(intercept)
+
+
+
+def theil_sen_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
+    if len(points_mm) < 2:
+        return None
+
+    x = points_mm[:, 0].astype(np.float64)
+    y = points_mm[:, 1].astype(np.float64)
+
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if len(x) < 2:
+        return None
+
+    unique_x = np.unique(x)
+    if len(unique_x) < 2:
+        return None
+
+    slopes = []
+    for i in range(len(x) - 1):
+        dx = x[i + 1:] - x[i]
+        dy = y[i + 1:] - y[i]
+        valid = np.abs(dx) > 1e-12
+        if np.any(valid):
+            slopes.extend((dy[valid] / dx[valid]).tolist())
+
+    if not slopes:
+        return None
+
+    slope = float(np.median(np.array(slopes, dtype=np.float64)))
+    intercept = float(np.median(y - slope * x))
+
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+
+    return slope, intercept
+
+
+def ransac_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
+    if len(points_mm) < 2:
+        return None
+
+    x = points_mm[:, 0].astype(np.float64)
+    y = points_mm[:, 1].astype(np.float64)
+
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if len(x) < 2:
+        return None
+
+    unique_x = np.unique(x)
+    if len(unique_x) < 2:
+        return None
+
+    base_fit = least_squares_regression(np.column_stack((x, y)))
+    if base_fit is None:
+        return None
+
+    base_slope, base_intercept = base_fit
+    base_residual = np.abs(y - (base_slope * x + base_intercept))
+    residual_median = float(np.median(base_residual))
+    mad = float(np.median(np.abs(base_residual - residual_median)))
+    threshold = max(0.5, 2.5 * 1.4826 * mad)
+
+    rng = np.random.default_rng(7)
+    iterations = min(250, max(40, len(x) * 20))
+
+    best_mask = None
+    best_count = -1
+    best_error = np.inf
+
+    for _ in range(iterations):
+        i, j = rng.choice(len(x), size=2, replace=False)
+        dx = x[j] - x[i]
+        if abs(dx) <= 1e-12:
+            continue
+
+        slope_candidate = (y[j] - y[i]) / dx
+        intercept_candidate = y[i] - slope_candidate * x[i]
+
+        residual = np.abs(y - (slope_candidate * x + intercept_candidate))
+        inlier_mask = residual <= threshold
+        inlier_count = int(np.count_nonzero(inlier_mask))
+
+        if inlier_count < 2:
+            continue
+
+        error = float(np.mean(residual[inlier_mask] ** 2))
+        if inlier_count > best_count or (inlier_count == best_count and error < best_error):
+            best_mask = inlier_mask
+            best_count = inlier_count
+            best_error = error
+
+    if best_mask is None or int(np.count_nonzero(best_mask)) < 2:
+        return None
+
+    refined_points = np.column_stack((x[best_mask], y[best_mask]))
+    refined_fit = least_squares_regression(refined_points)
+    if refined_fit is None:
+        return None
+
+    slope, intercept = refined_fit
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+
+    return float(slope), float(intercept)
+
+
+def orthogonal_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
+    if len(points_mm) < 2:
+        return None
+
+    x = points_mm[:, 0].astype(np.float64)
+    y = points_mm[:, 1].astype(np.float64)
+
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if len(x) < 2:
+        return None
+
+    unique_x = np.unique(x)
+    if len(unique_x) < 2:
+        return None
+
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    centered = np.column_stack((x - x_mean, y - y_mean))
+
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+
+    direction = vh[0]
+    if abs(float(direction[0])) <= 1e-12:
+        return None
+
+    slope = float(direction[1] / direction[0])
+    intercept = float(y_mean - slope * x_mean)
+
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+
+    return slope, intercept
+
+
+def fit_line_interface_2(points_mm: np.ndarray, method: str) -> tuple[float, float] | None:
+    if method == "theil_sen":
+        return theil_sen_regression(points_mm)
+    if method == "ransac":
+        return ransac_regression(points_mm)
+    if method == "orthogonal":
+        return orthogonal_regression(points_mm)
+    raise ValueError(f"Metodo de regresion no soportado en interfaz : {method}")
+
 def fit_line(points_mm: np.ndarray, method: str) -> tuple[float, float] | None:
     if method == "polyfit":
         return linear_regression(points_mm)
     if method == "least_squares":
         return least_squares_regression(points_mm)
+    if method == "gradient_descent":
+        return gradient_descent_regression(points_mm)
     raise ValueError(f"Metodo de regresion no soportado: {method}")
 
 
@@ -357,6 +580,248 @@ def draw_origin_and_roi(
             0.65,
             (0, 255, 0),
             2,
+            cv2.LINE_AA,
+        )
+
+
+
+def draw_regression_line_interface_2(
+    frame: np.ndarray,
+    mapper: CoordinateMapper,
+    slope: float,
+    intercept: float,
+    points_mm: np.ndarray,
+) -> None:
+    if len(points_mm) < 2:
+        return
+
+    x_min = float(np.min(points_mm[:, 0]))
+    x_max = float(np.max(points_mm[:, 0]))
+
+    x_line = np.array([x_min, x_max], dtype=np.float64)
+    y_line = slope * x_line + intercept
+
+    line_mm = np.column_stack((x_line, y_line))
+    line_px = mapper.machine_to_pixel(line_mm)
+
+    p1 = tuple(np.round(line_px[0]).astype(int))
+    p2 = tuple(np.round(line_px[1]).astype(int))
+
+    cv2.line(frame, p1, p2, (255, 0, 255), 4)
+    cv2.line(frame, p1, p2, (255, 255, 255), 1)
+
+
+def draw_origin_and_roi_interface_2(
+    frame: np.ndarray,
+    origin_px: np.ndarray | None,
+    roi: tuple[int, int, int, int] | None,
+) -> None:
+    if roi is not None:
+        x1, y1, x2, y2 = normalize_roi(roi, frame.shape)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 255), 3)
+
+        corner_size = 28
+        corners = [
+            ((x1, y1), (x1 + corner_size, y1), (x1, y1 + corner_size)),
+            ((x2, y1), (x2 - corner_size, y1), (x2, y1 + corner_size)),
+            ((x1, y2), (x1 + corner_size, y2), (x1, y2 - corner_size)),
+            ((x2, y2), (x2 - corner_size, y2), (x2, y2 - corner_size)),
+        ]
+
+        for origin, horizontal, vertical in corners:
+            cv2.line(frame, origin, horizontal, (0, 255, 255), 4)
+            cv2.line(frame, origin, vertical, (0, 255, 255), 4)
+
+        cv2.putText(
+            frame,
+            "ZONA DE LECTURA",
+            (x1, max(25, y1 - 10)),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if origin_px is not None:
+        ox, oy = np.round(origin_px).astype(int)
+        diamond = np.array(
+            [[ox, oy - 18], [ox + 18, oy], [ox, oy + 18], [ox - 18, oy]],
+            dtype=np.int32,
+        )
+        cv2.polylines(frame, [diamond], True, (255, 255, 0), 3)
+        cv2.circle(frame, (ox, oy), 5, (255, 255, 255), -1)
+        cv2.putText(
+            frame,
+            "CERO CNC",
+            (ox + 22, oy + 6),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def draw_interface_2_dashboard(
+    frame: np.ndarray,
+    origin_px: np.ndarray | None,
+    roi: tuple[int, int, int, int] | None,
+    points_px: np.ndarray,
+    points_px_used: np.ndarray,
+    points_mm_used: np.ndarray,
+    current_method: str,
+    slope: float | None,
+    intercept: float | None,
+    mapper_missing: bool,
+    selection_mode: str | None,
+    current_camera_index: int | None,
+) -> None:
+    height, width = frame.shape[:2]
+
+    draw_origin_and_roi_interface_2(frame, origin_px, roi)
+
+    for x, y in points_px:
+        cv2.circle(frame, (int(x), int(y)), 4, (0, 0, 255), -1)
+        cv2.circle(frame, (int(x), int(y)), 9, (255, 255, 255), 1)
+
+    for x, y in points_px_used:
+        cv2.circle(frame, (int(x), int(y)), 12, (255, 255, 0), 2)
+
+    overlay = frame.copy()
+    panel_width = min(390, max(310, width // 3))
+    panel_x = width - panel_width
+    cv2.rectangle(overlay, (panel_x, 0), (width, height), (20, 18, 34), -1)
+    cv2.rectangle(overlay, (0, 0), (width, 58), (35, 12, 42), -1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    cv2.rectangle(frame, (panel_x, 0), (width - 1, height - 1), (255, 0, 255), 2)
+    cv2.line(frame, (panel_x, 0), (panel_x, height), (0, 255, 255), 3)
+
+    cv2.putText(
+        frame,
+        "INTERFAZ   |  ANALISIS NUMERICO ROBUSTO",
+        (18, 38),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.82,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    camera_text = (
+        f"Camara: {current_camera_index}"
+        if current_camera_index is not None
+        else "Camara: desconocida"
+    )
+
+    rows = [
+        ("Metodo", current_method),
+        ("Puntos ROI", str(len(points_px))),
+        ("Puntos usados", str(len(points_mm_used))),
+        ("Camara", camera_text.replace("Camara: ", "")),
+    ]
+
+    y_base = 42
+    for label, value in rows:
+        cv2.putText(
+            frame,
+            label.upper(),
+            (panel_x + 20, y_base),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            value,
+            (panel_x + 20, y_base + 28),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.72,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        y_base += 74
+
+    cv2.line(frame, (panel_x + 20, y_base - 20), (width - 20, y_base - 20), (120, 120, 160), 1)
+
+    if mapper_missing:
+        status = "Falta origen: usa U y clic"
+        status_color = (0, 180, 255)
+    elif slope is not None and intercept is not None:
+        status = f"Y = {slope:.3f}X + {intercept:.3f}"
+        status_color = (0, 255, 180)
+    else:
+        status = "Minimo 2 puntos validos"
+        status_color = (0, 180, 255)
+
+    cv2.putText(
+        frame,
+        "ESTADO",
+        (panel_x + 20, y_base + 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        status,
+        (panel_x + 20, y_base + 42),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        status_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    if selection_mode is not None:
+        cv2.putText(
+            frame,
+            f"Seleccion activa: {selection_mode}",
+            (panel_x + 20, y_base + 78),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    controls = [
+        "U: origen",
+        "J: ROI",
+        "K: guardar + GRBL",
+        "N: metodo",
+        "V: camara",
+        "X: salir",
+    ]
+
+    y_controls = height - 196
+    cv2.putText(
+        frame,
+        "TECLAS INTERFAZ ",
+        (panel_x + 20, y_controls - 20),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.58,
+        (255, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    for index, control in enumerate(controls):
+        y = y_controls + index * 24
+        cv2.putText(
+            frame,
+            control,
+            (panel_x + 20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (230, 230, 230),
+            1,
             cv2.LINE_AA,
         )
 
@@ -464,7 +929,7 @@ def detect_arduino_serial_port() -> str | None:
             return str(port_info.device)
 
     return str(candidates[0].device)
-
+SECONDARY_METHODS = ("theil_sen", "ransac", "orthogonal")
 
 def read_grbl_response(ser: Any, timeout_s: float) -> str | None:
     deadline = time.time() + timeout_s
@@ -611,6 +1076,46 @@ def set_mouse_callback(window_name: str, state: RuntimeSelection) -> None:
                 print(f"ROI seleccionado: ({x1}, {y1}, {x}, {y})")
 
     cv2.setMouseCallback(window_name, on_mouse)
+
+
+
+
+def clear_console() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def print_interface_1_instructions() -> None:
+    print("Controles interfaz :")
+    print("- o: seleccionar origen 0,0. Despues haz clic sobre el rectangulo verde.")
+    print("- r: seleccionar ROI. Despues haz clic en dos esquinas del cuadrado blanco.")
+    print("- g: guardar grafica PNG, generar G-code y enviarlo a GRBL")
+    print("- c: cambiar a la siguiente camara disponible")
+    print("- m: cambiar metodo de regresion")
+    print("- q: salir")
+    print("")
+    print("Convencion activa por defecto:")
+    print("- Derecha en imagen = X negativo")
+    print("- Arriba en imagen = Y negativo")
+    print("- Z positivo = arriba")
+    print("- Regresion solo con sector III: X<0, Y<0")
+
+
+def print_interface_2_instructions() -> None:
+    print("Controles interfaz :")
+    print("- u: seleccionar origen 0,0  ")
+    print("- j: seleccionar ROI  ")
+    print("- k: guardar grafica, y enviar al cnc")
+    print("- v: cambiar  camara ")
+    print("- n: cambiar metodo de regresion de la interfaz ")
+
+    print("- x: salir")
+    print("")
+    print("Metodos disponibles en interfaz :")
+    print("- theil_sen")
+    print("- ransac")
+    print("- orthogonal")
+    print("")
+
 
 
 # ============================================================
@@ -807,6 +1312,8 @@ def main() -> None:
     print("- Regresion solo con sector III: X<0, Y<0")
 
     current_method = args.method
+    current_secondary_method = SECONDARY_METHODS[0]
+    visual_interface = 1
 
     while True:
         ret, frame = cap.read()
@@ -836,224 +1343,385 @@ def main() -> None:
                 sector_tolerance_mm=args.sector_tolerance_mm,
             )
 
-            fit = fit_line(points_mm_used, current_method)
+            if visual_interface == 1:
+                fit = fit_line(points_mm_used, current_method)
+            else:
+                fit = fit_line_interface_2(points_mm_used, current_secondary_method)
+
             if fit is not None:
                 slope, intercept = fit
-                draw_regression_line(frame, mapper, slope, intercept, points_mm_used)
+                if visual_interface == 1:
+                    draw_regression_line(frame, mapper, slope, intercept, points_mm_used)
+                else:
+                    draw_regression_line_interface_2(frame, mapper, slope, intercept, points_mm_used)
 
-        draw_origin_and_roi(frame, state.origin_px, state.roi)
+        if visual_interface == 1:
+            draw_origin_and_roi(frame, state.origin_px, state.roi)
 
-        for x, y in points_px:
-            cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
+            for x, y in points_px:
+                cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
 
-        for x, y in points_px_used:
-            cv2.circle(frame, (int(x), int(y)), 9, (255, 0, 0), 2)
+            for x, y in points_px_used:
+                cv2.circle(frame, (int(x), int(y)), 9, (255, 0, 0), 2)
 
-        cv2.putText(
-            frame,
-            f"Puntos rojos ROI: {len(points_px)}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            frame,
-            f"Usados sector III: {len(points_mm_used)}",
-            (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (180, 255, 180),
-            2,
-            cv2.LINE_AA,
-        )
-
-        camera_text = (
-            f"Camara activa: {current_camera_index}"
-            if current_camera_index is not None
-            else "Camara activa: desconocida"
-        )
-        cv2.putText(
-            frame,
-            camera_text,
-            (10, 85),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (200, 200, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            frame,
-            f"Metodo: {current_method}",
-            (10, 115),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (180, 255, 180),
-            2,
-            cv2.LINE_AA,
-        )
-
-        if state.mode is not None:
             cv2.putText(
                 frame,
-                f"Modo seleccion: {state.mode}",
-                (10, 145),
+                f"Puntos rojos ROI: {len(points_px)}",
+                (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (0, 255, 255),
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
 
-        if mapper is None:
             cv2.putText(
                 frame,
-                "Falta origen: presiona 'o' y clic en el rectangulo verde",
-                (10, frame.shape[0] - 25),
+                f"Usados sector III: {len(points_mm_used)}",
+                (10, 55),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 165, 255),
+                0.7,
+                (180, 255, 180),
                 2,
                 cv2.LINE_AA,
             )
-        elif slope is not None and intercept is not None:
+
+            camera_text = (
+                f"Camara activa: {current_camera_index}"
+                if current_camera_index is not None
+                else "Camara activa: desconocida"
+            )
             cv2.putText(
                 frame,
-                f"Ymm = {slope:.3f}Xmm + {intercept:.3f}",
-                (10, frame.shape[0] - 25),
+                camera_text,
+                (10, 85),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 0),
+                0.7,
+                (200, 200, 255),
                 2,
                 cv2.LINE_AA,
             )
+
+            cv2.putText(
+                frame,
+                f"Metodo: {current_method}",
+                (10, 115),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (180, 255, 180),
+                2,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame,
+                "   ",
+                (10, 145),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 220, 180),
+                2,
+                cv2.LINE_AA,
+            )
+
+            if state.mode is not None:
+                cv2.putText(
+                    frame,
+                    f"Modo seleccion: {state.mode}",
+                    (10, 175),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            if mapper is None:
+                cv2.putText(
+                    frame,
+                    "Falta origen: presiona 'o' y clic en el rectangulo verde",
+                    (10, frame.shape[0] - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            elif slope is not None and intercept is not None:
+                cv2.putText(
+                    frame,
+                    f"Ymm = {slope:.3f}Xmm + {intercept:.3f}",
+                    (10, frame.shape[0] - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.putText(
+                    frame,
+                    "Se necesitan al menos 2 puntos validos en sector III",
+                    (10, frame.shape[0] - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
         else:
-            cv2.putText(
-                frame,
-                "Se necesitan al menos 2 puntos validos en sector III",
-                (10, frame.shape[0] - 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 165, 255),
-                2,
-                cv2.LINE_AA,
+            draw_interface_2_dashboard(
+                frame=frame,
+                origin_px=state.origin_px,
+                roi=state.roi,
+                points_px=points_px,
+                points_px_used=points_px_used,
+                points_mm_used=points_mm_used,
+                current_method=current_secondary_method,
+                slope=slope,
+                intercept=intercept,
+                mapper_missing=mapper is None,
+                selection_mode=state.mode,
+                current_camera_index=current_camera_index,
             )
 
         cv2.imshow(window_name, frame)
 
         key = cv2.waitKey(1) & 0xFF
+        if 65 <= key <= 90:
+            key += 32
 
-        if key == ord("g"):
-            if mapper is None:
-                print("Primero debes seleccionar el origen 0,0 con la tecla 'o'.")
-                continue
+        if visual_interface == 1:
+            if key == ord("i"):
+                visual_interface = 2
+                state.mode = None
+                state.roi_first_corner = None
+                clear_console()
+                print("Interfaz visual  activa.")
+                print_interface_2_instructions()
 
-            points_px_used, points_mm_used, _ = select_regression_points(
-                points_px=points_px,
-                mapper=mapper,
-                only_sector_3=not args.no_sector_3,
-                sector_tolerance_mm=args.sector_tolerance_mm,
-            )
+            elif key == ord("g"):
+                if mapper is None:
+                    print("Primero debes seleccionar el origen 0,0 con la tecla 'o'.")
+                    continue
 
-            fit = fit_line(points_mm_used, current_method)
-            if fit is not None:
-                slope, intercept = fit
-
-                save_regression_plot(
-                    points_mm=points_mm_used,
-                    slope=slope,
-                    intercept=intercept,
-                    output_path="regression_plot.png",
-                    method_label=current_method,
+                points_px_used, points_mm_used, _ = select_regression_points(
+                    points_px=points_px,
+                    mapper=mapper,
+                    only_sector_3=not args.no_sector_3,
+                    sector_tolerance_mm=args.sector_tolerance_mm,
                 )
-                print("Grafica guardada en regression_plot.png")
-                print(f"Regresion CNC: Y = {slope:.6f}X + {intercept:.6f}")
-                print("Puntos usados en mm:")
-                for x_mm, y_mm in points_mm_used:
-                    print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
 
-                try:
-                    save_grbl_line_gcode(
+                fit = fit_line(points_mm_used, current_method)
+                if fit is not None:
+                    slope, intercept = fit
+
+                    save_regression_plot(
                         points_mm=points_mm_used,
                         slope=slope,
                         intercept=intercept,
-                        output_path=args.gcode_output,
-                        feed_rate=max(1.0, args.feed_rate),
-                        plunge_feed_rate=max(1.0, args.plunge_feed_rate),
-                        z_safe=args.z_safe,
-                        z_work=args.z_work,
+                        output_path="regression_plot.png",
                         method_label=current_method,
-                        return_origin=args.return_origin,
                     )
-                    print(f"G-code GRBL guardado en {args.gcode_output}")
+                    print("Grafica guardada en regression_plot.png")
+                    print(f"Regresion CNC: Y = {slope:.6f}X + {intercept:.6f}")
+                    print("Puntos usados en mm:")
+                    for x_mm, y_mm in points_mm_used:
+                        print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
 
-                    if not args.no_auto_send_grbl:
-                        ok, message = send_gcode_to_grbl(
-                            gcode_path=args.gcode_output,
-                            port=args.grbl_port.strip() or None,
-                            baud_rate=max(1200, args.grbl_baud),
+                    try:
+                        save_grbl_line_gcode(
+                            points_mm=points_mm_used,
+                            slope=slope,
+                            intercept=intercept,
+                            output_path=args.gcode_output,
+                            feed_rate=max(1.0, args.feed_rate),
+                            plunge_feed_rate=max(1.0, args.plunge_feed_rate),
+                            z_safe=args.z_safe,
+                            z_work=args.z_work,
+                            method_label=current_method,
+                            return_origin=args.return_origin,
                         )
-                        print(message)
-                    else:
-                        print("Envio automatico desactivado por --no-auto-send-grbl")
+                        print(f"G-code GRBL guardado en {args.gcode_output}")
 
-                except ValueError as error:
-                    print(f"No se pudo generar G-code: {error}")
-            else:
-                print("No se pudo calcular una regresion estable con los puntos actuales.")
-                print("Verifica que haya al menos 2 puntos rojos dentro del ROI y en sector III.")
+                        if not args.no_auto_send_grbl:
+                            ok, message = send_gcode_to_grbl(
+                                gcode_path=args.gcode_output,
+                                port=args.grbl_port.strip() or None,
+                                baud_rate=max(1200, args.grbl_baud),
+                            )
+                            print(message)
+                        else:
+                            print("Envio automatico desactivado por --no-auto-send-grbl")
 
-        elif key == ord("o"):
-            state.mode = "origin"
-            state.roi_first_corner = None
-            print("Haz clic sobre el rectangulo verde que representa X0 Y0.")
+                    except ValueError as error:
+                        print(f"No se pudo generar G-code: {error}")
+                else:
+                    print("No se pudo calcular una regresion estable con los puntos actuales.")
+                    print("Verifica que haya al menos 2 puntos rojos dentro del ROI y en sector III.")
 
-        elif key == ord("r"):
-            state.mode = "roi"
-            state.roi_first_corner = None
-            print("Haz clic en una esquina del cuadrado blanco y luego en la esquina opuesta.")
+            elif key == ord("o"):
+                state.mode = "origin"
+                state.roi_first_corner = None
+                print("Haz clic sobre el rectangulo verde que representa X0 Y0.")
 
-        elif key == ord("m"):
-            current_index = AVAILABLE_METHODS.index(current_method)
-            next_index = (current_index + 1) % len(AVAILABLE_METHODS)
-            current_method = AVAILABLE_METHODS[next_index]
-            print(f"Metodo de regresion activo: {current_method}")
+            elif key == ord("r"):
+                state.mode = "roi"
+                state.roi_first_corner = None
+                print("Haz clic en una esquina del cuadrado blanco y luego en la esquina opuesta.")
 
-        elif key == ord("c"):
-            if not available_camera_indices:
-                available_camera_indices = scan_available_cameras(max_index=max(0, args.max_camera_index))
+            elif key == ord("m"):
+                current_index = AVAILABLE_METHODS.index(current_method)
+                next_index = (current_index + 1) % len(AVAILABLE_METHODS)
+                current_method = AVAILABLE_METHODS[next_index]
+                print(f"Metodo de regresion activo: {current_method}")
 
-            if not available_camera_indices:
-                print("No hay camaras disponibles para cambiar.")
-                continue
+            elif key == ord("c"):
+                if not available_camera_indices:
+                    available_camera_indices = scan_available_cameras(max_index=max(0, args.max_camera_index))
 
-            if current_camera_index in available_camera_indices:
-                current_position = available_camera_indices.index(current_camera_index)
-                next_position = (current_position + 1) % len(available_camera_indices)
-            else:
-                next_position = 0
+                if not available_camera_indices:
+                    print("No hay camaras disponibles para cambiar.")
+                    continue
 
-            next_index = available_camera_indices[next_position]
-            new_cap = cv2.VideoCapture(next_index, cv2.CAP_DSHOW)
-            opened, _ = new_cap.read()
-            if opened:
-                cap.release()
-                cap = new_cap
-                current_camera_index = next_index
-                cv2.setMouseCallback(window_name, lambda *args_lambda: None)
-                set_mouse_callback(window_name, state)
-                print(f"Cambio de camara exitoso. Camara activa: {next_index}")
-            else:
-                new_cap.release()
-                print(f"No se pudo cambiar a la camara {next_index}.")
+                if current_camera_index in available_camera_indices:
+                    current_position = available_camera_indices.index(current_camera_index)
+                    next_position = (current_position + 1) % len(available_camera_indices)
+                else:
+                    next_position = 0
 
-        elif key == ord("q"):
-            break
+                next_index = available_camera_indices[next_position]
+                new_cap = cv2.VideoCapture(next_index, cv2.CAP_DSHOW)
+                opened, _ = new_cap.read()
+                if opened:
+                    cap.release()
+                    cap = new_cap
+                    current_camera_index = next_index
+                    cv2.setMouseCallback(window_name, lambda *args_lambda: None)
+                    set_mouse_callback(window_name, state)
+                    print(f"Cambio de camara exitoso. Camara activa: {next_index}")
+                else:
+                    new_cap.release()
+                    print(f"No se pudo cambiar a la camara {next_index}.")
+
+            elif key == ord("q"):
+                break
+
+        else:
+            if key == ord("k"):
+                if mapper is None:
+                    print("Primero debes seleccionar el origen 0,0 con la tecla 'u' en la interfaz .")
+                    continue
+
+                points_px_used, points_mm_used, _ = select_regression_points(
+                    points_px=points_px,
+                    mapper=mapper,
+                    only_sector_3=not args.no_sector_3,
+                    sector_tolerance_mm=args.sector_tolerance_mm,
+                )
+
+                fit = fit_line_interface_2(points_mm_used, current_secondary_method)
+                if fit is not None:
+                    slope, intercept = fit
+
+                    save_regression_plot(
+                        points_mm=points_mm_used,
+                        slope=slope,
+                        intercept=intercept,
+                        output_path="regression_plot_interface_2.png",
+                        method_label=current_secondary_method,
+                    )
+                    print("Grafica guardada en regression_plot_interface_2.png")
+                    print(f"Regresion CNC interfaz : Y = {slope:.6f}X + {intercept:.6f}")
+                    print("Puntos usados en mm:")
+                    for x_mm, y_mm in points_mm_used:
+                        print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
+
+                    try:
+                        save_grbl_line_gcode(
+                            points_mm=points_mm_used,
+                            slope=slope,
+                            intercept=intercept,
+                            output_path=args.gcode_output,
+                            feed_rate=max(1.0, args.feed_rate),
+                            plunge_feed_rate=max(1.0, args.plunge_feed_rate),
+                            z_safe=args.z_safe,
+                            z_work=args.z_work,
+                            method_label=current_secondary_method,
+                            return_origin=args.return_origin,
+                        )
+                        print(f"G-code GRBL guardado en {args.gcode_output}")
+
+                        if not args.no_auto_send_grbl:
+                            ok, message = send_gcode_to_grbl(
+                                gcode_path=args.gcode_output,
+                                port=args.grbl_port.strip() or None,
+                                baud_rate=max(1200, args.grbl_baud),
+                            )
+                            print(message)
+                        else:
+                            print("Envio automatico desactivado por --no-auto-send-grbl")
+
+                    except ValueError as error:
+                        print(f"No se pudo generar G-code: {error}")
+                else:
+                    print("No se pudo calcular una regresion estable con los puntos actuales en interfaz .")
+                    print("Verifica que haya al menos 2 puntos rojos dentro del ROI y en sector III.")
+
+            elif key == ord("u"):
+                state.mode = "origin"
+                state.roi_first_corner = None
+                print("Interfaz : haz clic sobre el punto que representa X0 Y0.")
+
+            elif key == ord("j"):
+                state.mode = "roi"
+                state.roi_first_corner = None
+                print("Interfaz : haz clic en dos esquinas para definir el ROI.")
+
+            elif key == ord("n"):
+                current_index = SECONDARY_METHODS.index(current_secondary_method)
+                next_index = (current_index + 1) % len(SECONDARY_METHODS)
+                current_secondary_method = SECONDARY_METHODS[next_index]
+                print(f"Metodo interfaz  activo: {current_secondary_method}")
+
+            elif key == ord("v"):
+                if not available_camera_indices:
+                    available_camera_indices = scan_available_cameras(max_index=max(0, args.max_camera_index))
+
+                if not available_camera_indices:
+                    print("No hay camaras disponibles para cambiar.")
+                    continue
+
+                if current_camera_index in available_camera_indices:
+                    current_position = available_camera_indices.index(current_camera_index)
+                    next_position = (current_position + 1) % len(available_camera_indices)
+                else:
+                    next_position = 0
+
+                next_index = available_camera_indices[next_position]
+                new_cap = cv2.VideoCapture(next_index, cv2.CAP_DSHOW)
+                opened, _ = new_cap.read()
+                if opened:
+                    cap.release()
+                    cap = new_cap
+                    current_camera_index = next_index
+                    cv2.setMouseCallback(window_name, lambda *args_lambda: None)
+                    set_mouse_callback(window_name, state)
+                    print(f"Interfaz : cambio de camara exitoso. Camara activa: {next_index}")
+                else:
+                    new_cap.release()
+                    print(f"No se pudo cambiar a la camara {next_index}.")
+
+            elif key == ord("b"):
+                visual_interface = 1
+                state.mode = None
+                state.roi_first_corner = None
+                clear_console()
+                print("Volviste a la interfaz visual .")
+                print_interface_1_instructions()
+
+            elif key == ord("x"):
+                break
 
     cap.release()
     cv2.destroyAllWindows()

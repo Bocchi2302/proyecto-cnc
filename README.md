@@ -78,7 +78,7 @@ Luego haz clic en dos esquinas opuestas de la zona donde están los puntos rojos
 
 ## Cambiar método de regresión
 
-Dentro de la interfaz 2, presiona:
+Dentro de la interfaz , presiona:
 
 ```text
 n

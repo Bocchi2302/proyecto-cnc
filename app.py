@@ -126,6 +126,12 @@ class RuntimeSelection:
     mode: str | None = None
     roi_first_corner: tuple[int, int] | None = None
 
+    # Datos usados solo por la interfaz  para separar visualmente
+    # la vista de camara y el panel derecho sin dañar los clics.
+    visual_interface: int = 1
+    interface_2_view_box: tuple[int, int, int, int] | None = None
+    interface_2_source_shape: tuple[int, int] | None = None
+
 
 def build_mapper(
     origin_px: np.ndarray | None,
@@ -676,78 +682,207 @@ def draw_interface_2_dashboard(
     mapper_missing: bool,
     selection_mode: str | None,
     current_camera_index: int | None,
-) -> None:
-    height, width = frame.shape[:2]
+    layout_state: RuntimeSelection | None = None,
+) -> np.ndarray:
+    """
+    Interfaz visual 2 separada:
+    - Lado izquierdo: solo vista de camara.
+    - Lado derecho: panel de controles, metodo activo y estado.
+    """
+    source_height, source_width = frame.shape[:2]
 
-    draw_origin_and_roi_interface_2(frame, origin_px, roi)
+    camera_view = frame.copy()
+
+    draw_origin_and_roi_interface_2(camera_view, origin_px, roi)
 
     for x, y in points_px:
-        cv2.circle(frame, (int(x), int(y)), 4, (0, 0, 255), -1)
-        cv2.circle(frame, (int(x), int(y)), 9, (255, 255, 255), 1)
+        cv2.circle(camera_view, (int(x), int(y)), 4, (0, 0, 255), -1)
+        cv2.circle(camera_view, (int(x), int(y)), 9, (255, 255, 255), 1)
 
     for x, y in points_px_used:
-        cv2.circle(frame, (int(x), int(y)), 12, (255, 255, 0), 2)
+        cv2.circle(camera_view, (int(x), int(y)), 12, (255, 255, 0), 2)
 
-    overlay = frame.copy()
-    panel_width = min(390, max(310, width // 3))
-    panel_x = width - panel_width
-    cv2.rectangle(overlay, (panel_x, 0), (width, height), (20, 18, 34), -1)
-    cv2.rectangle(overlay, (0, 0), (width, 58), (35, 12, 42), -1)
-    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+    # ============================================================
+    # CANVAS GENERAL: CAMARA IZQUIERDA + PANEL DERECHO
+    # ============================================================
 
-    cv2.rectangle(frame, (panel_x, 0), (width - 1, height - 1), (255, 0, 255), 2)
-    cv2.line(frame, (panel_x, 0), (panel_x, height), (0, 255, 255), 3)
+    canvas_height = max(720, source_height)
+    camera_area_width = max(900, int(round(canvas_height * source_width / max(1, source_height))))
+    side_panel_width = 440
+    canvas_width = camera_area_width + side_panel_width
 
+    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    canvas[:] = (12, 14, 22)
+
+    panel_x = camera_area_width
+
+    # Fondos
+    cv2.rectangle(canvas, (0, 0), (camera_area_width, canvas_height), (10, 12, 18), -1)
+    cv2.rectangle(canvas, (panel_x, 0), (canvas_width, canvas_height), (24, 20, 38), -1)
+    cv2.line(canvas, (panel_x, 0), (panel_x, canvas_height), (0, 255, 255), 3)
+
+    # Encabezado de la vista de camara
+    header_height = 58
+    cv2.rectangle(canvas, (0, 0), (camera_area_width, header_height), (34, 12, 42), -1)
     cv2.putText(
-        frame,
-        "INTERFAZ   |  ANALISIS NUMERICO ROBUSTO",
-        (18, 38),
+        canvas,
+        "VISTA DE CAMARA",
+        (22, 38),
         cv2.FONT_HERSHEY_DUPLEX,
-        0.82,
+        0.78,
         (255, 255, 255),
         2,
         cv2.LINE_AA,
     )
 
-    camera_text = (
-        f"Camara: {current_camera_index}"
-        if current_camera_index is not None
-        else "Camara: desconocida"
+    # Ajuste de la imagen de camara dentro del espacio izquierdo
+    margin = 18
+    available_width = camera_area_width - 2 * margin
+    available_height = canvas_height - header_height - 2 * margin
+
+    scale = min(
+        available_width / max(1, source_width),
+        available_height / max(1, source_height),
     )
 
-    rows = [
-        ("Metodo", current_method),
-        ("Puntos ROI", str(len(points_px))),
-        ("Puntos usados", str(len(points_mm_used))),
-        ("Camara", camera_text.replace("Camara: ", "")),
-    ]
+    display_width = max(1, int(round(source_width * scale)))
+    display_height = max(1, int(round(source_height * scale)))
 
-    y_base = 42
-    for label, value in rows:
+    resized_camera = cv2.resize(camera_view, (display_width, display_height), interpolation=cv2.INTER_LINEAR)
+
+    camera_x = margin + (available_width - display_width) // 2
+    camera_y = header_height + margin + (available_height - display_height) // 2
+
+    canvas[camera_y:camera_y + display_height, camera_x:camera_x + display_width] = resized_camera
+
+    # Marco exclusivo para la zona de camara
+    cv2.rectangle(
+        canvas,
+        (camera_x - 2, camera_y - 2),
+        (camera_x + display_width + 2, camera_y + display_height + 2),
+        (0, 255, 255),
+        2,
+    )
+
+    if layout_state is not None:
+        layout_state.interface_2_view_box = (
+            camera_x,
+            camera_y,
+            camera_x + display_width,
+            camera_y + display_height,
+        )
+        layout_state.interface_2_source_shape = (source_height, source_width)
+
+    # ============================================================
+    # FUNCIONES PARA TEXTO DEL PANEL DERECHO
+    # ============================================================
+
+    panel_padding = 24
+    text_x = panel_x + panel_padding
+    text_right = canvas_width - panel_padding
+    text_width = text_right - text_x
+
+    def fit_text_to_width(
+        text: str,
+        font: int,
+        scale_value: float,
+        thickness: int,
+        max_width: int,
+    ) -> str:
+        safe_text = str(text)
+        text_size, _ = cv2.getTextSize(safe_text, font, scale_value, thickness)
+        if text_size[0] <= max_width:
+            return safe_text
+
+        ellipsis = "..."
+        while len(safe_text) > 3:
+            candidate = safe_text[:-1] + ellipsis
+            text_size, _ = cv2.getTextSize(candidate, font, scale_value, thickness)
+            if text_size[0] <= max_width:
+                return candidate
+            safe_text = safe_text[:-1]
+
+        return ellipsis
+
+    def put_fit(
+        text: str,
+        x: int,
+        y: int,
+        font: int,
+        scale_value: float,
+        color: tuple[int, int, int],
+        thickness: int = 1,
+        max_width: int | None = None,
+    ) -> None:
+        allowed_width = text_width if max_width is None else max_width
         cv2.putText(
-            frame,
-            label.upper(),
-            (panel_x + 20, y_base),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 255, 255),
+            canvas,
+            fit_text_to_width(text, font, scale_value, thickness, allowed_width),
+            (x, y),
+            font,
+            scale_value,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    def draw_card(y: int, title: str, value: str, accent: tuple[int, int, int]) -> int:
+        card_height = 72
+        cv2.rectangle(
+            canvas,
+            (text_x - 10, y - 20),
+            (text_right + 10, y + card_height - 18),
+            (34, 30, 52),
+            -1,
+        )
+        cv2.rectangle(
+            canvas,
+            (text_x - 10, y - 20),
+            (text_right + 10, y + card_height - 18),
+            accent,
             1,
-            cv2.LINE_AA,
         )
-        cv2.putText(
-            frame,
-            value,
-            (panel_x + 20, y_base + 28),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.72,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        y_base += 74
 
-    cv2.line(frame, (panel_x + 20, y_base - 20), (width - 20, y_base - 20), (120, 120, 160), 1)
+        put_fit(title.upper(), text_x, y, cv2.FONT_HERSHEY_SIMPLEX, 0.44, accent, 1)
+        put_fit(value, text_x, y + 32, cv2.FONT_HERSHEY_DUPLEX, 0.66, (255, 255, 255), 2)
 
+        return y + card_height + 8
+
+    # ============================================================
+    # PANEL DERECHO
+    # ============================================================
+
+    cv2.rectangle(canvas, (panel_x, 0), (canvas_width, 76), (42, 18, 54), -1)
+
+    put_fit(
+        "INTERFAZ ",
+        text_x,
+        32,
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.78,
+        (255, 255, 255),
+        2,
+    )
+    put_fit(
+        "Analisis numerico robusto",
+        text_x,
+        58,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (0, 255, 255),
+        1,
+    )
+
+    y_panel = 110
+
+    camera_text = str(current_camera_index) if current_camera_index is not None else "desconocida"
+
+    y_panel = draw_card(y_panel, "Metodo seleccionado", current_method, (0, 255, 255))
+    y_panel = draw_card(y_panel, "Puntos detectados ROI", str(len(points_px)), (255, 255, 0))
+    y_panel = draw_card(y_panel, "Puntos usados", str(len(points_mm_used)), (0, 220, 120))
+    y_panel = draw_card(y_panel, "Camara activa", camera_text, (255, 160, 80))
+
+    # Estado
     if mapper_missing:
         status = "Falta origen: usa U y clic"
         status_color = (0, 180, 255)
@@ -758,72 +893,71 @@ def draw_interface_2_dashboard(
         status = "Minimo 2 puntos validos"
         status_color = (0, 180, 255)
 
-    cv2.putText(
-        frame,
-        "ESTADO",
-        (panel_x + 20, y_base + 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        (0, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        status,
-        (panel_x + 20, y_base + 42),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
-        status_color,
-        2,
-        cv2.LINE_AA,
-    )
+    y_panel += 8
+    cv2.line(canvas, (text_x, y_panel), (text_right, y_panel), (105, 105, 135), 1)
+    y_panel += 34
+
+    put_fit("ESTADO", text_x, y_panel, cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 255), 1)
+    put_fit(status, text_x, y_panel + 34, cv2.FONT_HERSHEY_SIMPLEX, 0.56, status_color, 2)
+    y_panel += 72
 
     if selection_mode is not None:
-        cv2.putText(
-            frame,
+        put_fit(
             f"Seleccion activa: {selection_mode}",
-            (panel_x + 20, y_base + 78),
+            text_x,
+            y_panel,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.54,
+            0.52,
             (255, 255, 0),
             2,
-            cv2.LINE_AA,
         )
+        y_panel += 36
 
+    # Metodos disponibles
+    y_panel += 8
+    cv2.line(canvas, (text_x, y_panel), (text_right, y_panel), (105, 105, 135), 1)
+    y_panel += 34
+    put_fit("MODELOS DISPONIBLES", text_x, y_panel, cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 255, 0), 2)
+    y_panel += 32
+
+    for method_name in SECONDARY_METHODS:
+        is_active = method_name == current_method
+        color = (0, 255, 180) if is_active else (220, 220, 225)
+        marker = ">" if is_active else "-"
+        put_fit(
+            f"{marker} {method_name}",
+            text_x + 4,
+            y_panel,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            color,
+            2 if is_active else 1,
+        )
+        y_panel += 27
+
+    # Controles fijos abajo
     controls = [
-        "U: origen",
-        "J: ROI",
-        "K: guardar + GRBL",
-        "N: metodo",
-        "V: camara",
+        "U: seleccionar origen",
+        "J: seleccionar ROI",
+        "K: guardar grafica + GRBL",
+        "N: cambiar metodo",
+        "V: cambiar camara",
+        "B: volver interfaz 1",
         "X: salir",
     ]
 
-    y_controls = height - 196
-    cv2.putText(
-        frame,
-        "TECLAS INTERFAZ ",
-        (panel_x + 20, y_controls - 20),
-        cv2.FONT_HERSHEY_DUPLEX,
-        0.58,
-        (255, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
+    controls_block_height = 36 + len(controls) * 28
+    y_controls = max(y_panel + 24, canvas_height - controls_block_height - 24)
 
-    for index, control in enumerate(controls):
-        y = y_controls + index * 24
-        cv2.putText(
-            frame,
-            control,
-            (panel_x + 20, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
+    cv2.line(canvas, (text_x, y_controls - 20), (text_right, y_controls - 20), (105, 105, 135), 1)
+    put_fit("CONTROLES", text_x, y_controls, cv2.FONT_HERSHEY_DUPLEX, 0.56, (255, 255, 0), 2)
+
+    y_key = y_controls + 34
+    for control in controls:
+        put_fit(control, text_x, y_key, cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1)
+        y_key += 28
+
+    return canvas
 
 
 def save_regression_plot(
@@ -1059,6 +1193,28 @@ def set_mouse_callback(window_name: str, state: RuntimeSelection) -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
+        # En la interfaz 2 la imagen de camara se muestra dentro de un canvas
+        # con panel lateral. Por eso el clic se convierte desde coordenadas
+        # del canvas a coordenadas reales del frame original de la camara.
+        if state.visual_interface == 2:
+            if state.interface_2_view_box is None or state.interface_2_source_shape is None:
+                return
+
+            view_x1, view_y1, view_x2, view_y2 = state.interface_2_view_box
+            source_height, source_width = state.interface_2_source_shape
+
+            if not (view_x1 <= x < view_x2 and view_y1 <= y < view_y2):
+                return
+
+            view_width = max(1, view_x2 - view_x1)
+            view_height = max(1, view_y2 - view_y1)
+
+            x = int(round((x - view_x1) * (source_width - 1) / max(1, view_width - 1)))
+            y = int(round((y - view_y1) * (source_height - 1) / max(1, view_height - 1)))
+
+            x = int(np.clip(x, 0, source_width - 1))
+            y = int(np.clip(y, 0, source_height - 1))
+
         if state.mode == "origin":
             state.origin_px = np.array([x, y], dtype=np.float64)
             state.mode = None
@@ -1107,7 +1263,6 @@ def print_interface_2_instructions() -> None:
     print("- k: guardar grafica, y enviar al cnc")
     print("- v: cambiar  camara ")
     print("- n: cambiar metodo de regresion de la interfaz ")
-
     print("- x: salir")
     print("")
     print("Metodos disponibles en interfaz :")
@@ -1294,7 +1449,8 @@ def main() -> None:
     )
 
     window_name = "Deteccion de puntos + regresion lineal CNC"
-    cv2.namedWindow(window_name)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1000, 670)
     set_mouse_callback(window_name, state)
 
     print("Controles:")
@@ -1314,6 +1470,7 @@ def main() -> None:
     current_method = args.method
     current_secondary_method = SECONDARY_METHODS[0]
     visual_interface = 1
+    state.visual_interface = visual_interface
 
     while True:
         ret, frame = cap.read()
@@ -1470,7 +1627,7 @@ def main() -> None:
                     cv2.LINE_AA,
                 )
         else:
-            draw_interface_2_dashboard(
+            frame = draw_interface_2_dashboard(
                 frame=frame,
                 origin_px=state.origin_px,
                 roi=state.roi,
@@ -1483,6 +1640,7 @@ def main() -> None:
                 mapper_missing=mapper is None,
                 selection_mode=state.mode,
                 current_camera_index=current_camera_index,
+                layout_state=state,
             )
 
         cv2.imshow(window_name, frame)
@@ -1494,6 +1652,7 @@ def main() -> None:
         if visual_interface == 1:
             if key == ord("i"):
                 visual_interface = 2
+                state.visual_interface = visual_interface
                 state.mode = None
                 state.roi_first_corner = None
                 clear_console()
@@ -1714,6 +1873,9 @@ def main() -> None:
 
             elif key == ord("b"):
                 visual_interface = 1
+                state.visual_interface = visual_interface
+                state.interface_2_view_box = None
+                state.interface_2_source_shape = None
                 state.mode = None
                 state.roi_first_corner = None
                 clear_console()

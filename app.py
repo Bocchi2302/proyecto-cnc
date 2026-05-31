@@ -152,6 +152,25 @@ def build_mapper(
     )
 
 
+
+def get_interface_2_auto_origin(
+    roi: tuple[int, int, int, int] | None,
+    frame_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Devuelve el origen automatico de la interfaz .
+
+    El punto 0,0 se ubica en la esquina inferior izquierda del ROI.
+    Si aun no existe un ROI, se usa la esquina inferior izquierda
+    del frame completo de la camara.
+    """
+    x1, y1, _, y2 = normalize_roi(roi, frame_shape)
+
+    origin_x = x1
+    origin_y = max(y1, y2 - 1)
+
+    return np.array([origin_x, origin_y], dtype=np.float64)
+
 # ============================================================
 # DETECCION DE PUNTOS ROJOS
 # ============================================================
@@ -360,161 +379,213 @@ def gradient_descent_regression(points_mm: np.ndarray) -> tuple[float, float] | 
 
 
 
-def theil_sen_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
-    if len(points_mm) < 2:
+@dataclass(frozen=True)
+class Interface2CurveModel:
+    """
+    Modelo matematico de ajuste usado exclusivamente por la interfaz .
+
+    - theil_sen:   y = mx + b, recta robusta frente a valores atipicos
+    - quadratic:   y = ax^2 + bx + c
+    - logarithmic: y = a ln(-x) + b, apropiado para el sector III (x < 0)
+    """
+
+    method: str
+    coefficients: tuple[float, ...]
+    equation: str
+
+
+def _finite_curve_points(points_mm: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_mm, dtype=np.float64)
+
+    if points.ndim != 2 or points.shape[1] != 2:
+        return np.empty((0, 2), dtype=np.float64)
+
+    finite_mask = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    return points[finite_mask]
+
+
+def theil_sen_regression(points_mm: np.ndarray) -> Interface2CurveModel | None:
+    """
+    Ajuste lineal robusto de Theil-Sen:
+        y = mx + b
+
+    La pendiente se obtiene con la mediana de las pendientes entre pares
+    de puntos. El intercepto se calcula con la mediana de y - mx.
+    """
+    points = _finite_curve_points(points_mm)
+    if len(points) < 2 or len(np.unique(points[:, 0])) < 2:
         return None
 
-    x = points_mm[:, 0].astype(np.float64)
-    y = points_mm[:, 1].astype(np.float64)
+    x = points[:, 0]
+    y = points[:, 1]
 
-    finite_mask = np.isfinite(x) & np.isfinite(y)
-    x = x[finite_mask]
-    y = y[finite_mask]
-    if len(x) < 2:
-        return None
-
-    unique_x = np.unique(x)
-    if len(unique_x) < 2:
-        return None
-
-    slopes = []
-    for i in range(len(x) - 1):
-        dx = x[i + 1:] - x[i]
-        dy = y[i + 1:] - y[i]
-        valid = np.abs(dx) > 1e-12
-        if np.any(valid):
-            slopes.extend((dy[valid] / dx[valid]).tolist())
+    slopes: list[float] = []
+    for index in range(len(x) - 1):
+        dx = x[index + 1:] - x[index]
+        dy = y[index + 1:] - y[index]
+        valid_mask = np.abs(dx) > 1e-12
+        if np.any(valid_mask):
+            slopes.extend((dy[valid_mask] / dx[valid_mask]).tolist())
 
     if not slopes:
         return None
 
-    slope = float(np.median(np.array(slopes, dtype=np.float64)))
+    slope = float(np.median(np.asarray(slopes, dtype=np.float64)))
     intercept = float(np.median(y - slope * x))
 
-    if not np.isfinite(slope) or not np.isfinite(intercept):
+    if not np.all(np.isfinite([slope, intercept])):
         return None
 
-    return slope, intercept
+    return Interface2CurveModel(
+        method="theil_sen",
+        coefficients=(slope, intercept),
+        equation=f"Y = {slope:.4f}X {' + ' if intercept >= 0 else ' - '}{abs(intercept):.4f}",
+    )
 
 
-def ransac_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
-    if len(points_mm) < 2:
+def quadratic_regression(points_mm: np.ndarray) -> Interface2CurveModel | None:
+    """
+    Ajuste parabolico por minimos cuadrados:
+        y = ax^2 + bx + c
+    """
+    points = _finite_curve_points(points_mm)
+    if len(points) < 3 or len(np.unique(points[:, 0])) < 3:
         return None
 
-    x = points_mm[:, 0].astype(np.float64)
-    y = points_mm[:, 1].astype(np.float64)
-
-    finite_mask = np.isfinite(x) & np.isfinite(y)
-    x = x[finite_mask]
-    y = y[finite_mask]
-    if len(x) < 2:
-        return None
-
-    unique_x = np.unique(x)
-    if len(unique_x) < 2:
-        return None
-
-    base_fit = least_squares_regression(np.column_stack((x, y)))
-    if base_fit is None:
-        return None
-
-    base_slope, base_intercept = base_fit
-    base_residual = np.abs(y - (base_slope * x + base_intercept))
-    residual_median = float(np.median(base_residual))
-    mad = float(np.median(np.abs(base_residual - residual_median)))
-    threshold = max(0.5, 2.5 * 1.4826 * mad)
-
-    rng = np.random.default_rng(7)
-    iterations = min(250, max(40, len(x) * 20))
-
-    best_mask = None
-    best_count = -1
-    best_error = np.inf
-
-    for _ in range(iterations):
-        i, j = rng.choice(len(x), size=2, replace=False)
-        dx = x[j] - x[i]
-        if abs(dx) <= 1e-12:
-            continue
-
-        slope_candidate = (y[j] - y[i]) / dx
-        intercept_candidate = y[i] - slope_candidate * x[i]
-
-        residual = np.abs(y - (slope_candidate * x + intercept_candidate))
-        inlier_mask = residual <= threshold
-        inlier_count = int(np.count_nonzero(inlier_mask))
-
-        if inlier_count < 2:
-            continue
-
-        error = float(np.mean(residual[inlier_mask] ** 2))
-        if inlier_count > best_count or (inlier_count == best_count and error < best_error):
-            best_mask = inlier_mask
-            best_count = inlier_count
-            best_error = error
-
-    if best_mask is None or int(np.count_nonzero(best_mask)) < 2:
-        return None
-
-    refined_points = np.column_stack((x[best_mask], y[best_mask]))
-    refined_fit = least_squares_regression(refined_points)
-    if refined_fit is None:
-        return None
-
-    slope, intercept = refined_fit
-    if not np.isfinite(slope) or not np.isfinite(intercept):
-        return None
-
-    return float(slope), float(intercept)
-
-
-def orthogonal_regression(points_mm: np.ndarray) -> tuple[float, float] | None:
-    if len(points_mm) < 2:
-        return None
-
-    x = points_mm[:, 0].astype(np.float64)
-    y = points_mm[:, 1].astype(np.float64)
-
-    finite_mask = np.isfinite(x) & np.isfinite(y)
-    x = x[finite_mask]
-    y = y[finite_mask]
-    if len(x) < 2:
-        return None
-
-    unique_x = np.unique(x)
-    if len(unique_x) < 2:
-        return None
-
-    x_mean = float(np.mean(x))
-    y_mean = float(np.mean(y))
-    centered = np.column_stack((x - x_mean, y - y_mean))
+    x = points[:, 0]
+    y = points[:, 1]
 
     try:
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        a, b, c = np.polyfit(x, y, 2)
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+        return None
+
+    if not np.all(np.isfinite([a, b, c])):
+        return None
+
+    return Interface2CurveModel(
+        method="quadratic",
+        coefficients=(float(a), float(b), float(c)),
+        equation=f"Y = {a:.4f}X^2 {' + ' if b >= 0 else ' - '}{abs(b):.4f}X {' + ' if c >= 0 else ' - '}{abs(c):.4f}",
+    )
+
+
+def logarithmic_regression(points_mm: np.ndarray) -> Interface2CurveModel | None:
+    """
+    Ajuste logaritmico linealizado para el sector III:
+        y = a ln(-x) + b
+
+    Se usa -x porque los puntos validos del sector III tienen X negativo.
+    """
+    points = _finite_curve_points(points_mm)
+    if len(points) < 2:
+        return None
+
+    x = points[:, 0]
+    y = points[:, 1]
+
+    valid_mask = x < -1e-12
+    x = x[valid_mask]
+    y = y[valid_mask]
+
+    if len(x) < 2:
+        return None
+
+    transformed_x = np.log(-x)
+    if len(np.unique(np.round(transformed_x, 12))) < 2:
+        return None
+
+    design = np.column_stack((transformed_x, np.ones_like(transformed_x)))
+
+    try:
+        solution, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
     except np.linalg.LinAlgError:
         return None
 
-    direction = vh[0]
-    if abs(float(direction[0])) <= 1e-12:
+    a = float(solution[0])
+    b = float(solution[1])
+
+    if not np.all(np.isfinite([a, b])):
         return None
 
-    slope = float(direction[1] / direction[0])
-    intercept = float(y_mean - slope * x_mean)
-
-    if not np.isfinite(slope) or not np.isfinite(intercept):
-        return None
-
-    return slope, intercept
+    return Interface2CurveModel(
+        method="logarithmic",
+        coefficients=(a, b),
+        equation=f"Y = {a:.4f} ln(-X) {' + ' if b >= 0 else ' - '}{abs(b):.4f}",
+    )
 
 
-def fit_line_interface_2(points_mm: np.ndarray, method: str) -> tuple[float, float] | None:
+
+def fit_curve_interface_2(
+    points_mm: np.ndarray,
+    method: str,
+) -> Interface2CurveModel | None:
     if method == "theil_sen":
         return theil_sen_regression(points_mm)
-    if method == "ransac":
-        return ransac_regression(points_mm)
-    if method == "orthogonal":
-        return orthogonal_regression(points_mm)
-    raise ValueError(f"Metodo de regresion no soportado en interfaz : {method}")
+    if method == "quadratic":
+        return quadratic_regression(points_mm)
+    if method == "logarithmic":
+        return logarithmic_regression(points_mm)
+    raise ValueError(f"Modelo matematico no soportado en interfaz 2: {method}")
+
+
+def predict_curve_interface_2(
+    model: Interface2CurveModel,
+    x_values: np.ndarray,
+) -> np.ndarray:
+    x = np.asarray(x_values, dtype=np.float64)
+
+    if model.method == "theil_sen":
+        slope, intercept = model.coefficients
+        return slope * x + intercept
+
+    if model.method == "quadratic":
+        a, b, c = model.coefficients
+        return a * x * x + b * x + c
+
+    if model.method == "logarithmic":
+        a, b = model.coefficients
+        result = np.full_like(x, np.nan, dtype=np.float64)
+        valid_mask = x < -1e-12
+        result[valid_mask] = a * np.log(-x[valid_mask]) + b
+        return result
+
+    raise ValueError(f"Modelo matematico no soportado en interfaz 2: {model.method}")
+
+
+def sample_curve_interface_2(
+    model: Interface2CurveModel,
+    points_mm: np.ndarray,
+    sample_count: int = 120,
+    reverse: bool = False,
+) -> np.ndarray:
+    """
+    Muestrea la curva dentro del intervalo X cubierto por los puntos originales.
+    Esto permite dibujarla en OpenCV y convertirla en segmentos G-code.
+    """
+    points = _finite_curve_points(points_mm)
+    if len(points) < 2:
+        return np.empty((0, 2), dtype=np.float64)
+
+    x_min = float(np.min(points[:, 0]))
+    x_max = float(np.max(points[:, 0]))
+
+    if model.method == "logarithmic":
+        x_max = min(x_max, -1e-9)
+
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+        return np.empty((0, 2), dtype=np.float64)
+
+    if reverse:
+        x_values = np.linspace(x_max, x_min, max(2, int(sample_count)))
+    else:
+        x_values = np.linspace(x_min, x_max, max(2, int(sample_count)))
+
+    y_values = predict_curve_interface_2(model, x_values)
+    finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+
+    return np.column_stack((x_values[finite_mask], y_values[finite_mask]))
+
 
 def fit_line(points_mm: np.ndarray, method: str) -> tuple[float, float] | None:
     if method == "polyfit":
@@ -591,30 +662,36 @@ def draw_origin_and_roi(
 
 
 
-def draw_regression_line_interface_2(
+def draw_curve_interface_2(
     frame: np.ndarray,
     mapper: CoordinateMapper,
-    slope: float,
-    intercept: float,
+    model: Interface2CurveModel,
     points_mm: np.ndarray,
 ) -> None:
-    if len(points_mm) < 2:
+    """
+    Dibuja el modelo matematico de la interfaz  sobre el frame original.
+    La vista completa se redimensiona despues dentro del dashboard.
+    """
+    curve_mm = sample_curve_interface_2(
+        model=model,
+        points_mm=points_mm,
+        sample_count=180,
+    )
+
+    if len(curve_mm) < 2:
         return
 
-    x_min = float(np.min(points_mm[:, 0]))
-    x_max = float(np.max(points_mm[:, 0]))
+    curve_px = mapper.machine_to_pixel(curve_mm)
+    finite_mask = np.isfinite(curve_px[:, 0]) & np.isfinite(curve_px[:, 1])
+    curve_px = curve_px[finite_mask]
 
-    x_line = np.array([x_min, x_max], dtype=np.float64)
-    y_line = slope * x_line + intercept
+    if len(curve_px) < 2:
+        return
 
-    line_mm = np.column_stack((x_line, y_line))
-    line_px = mapper.machine_to_pixel(line_mm)
+    polyline = np.round(curve_px).astype(np.int32).reshape((-1, 1, 2))
 
-    p1 = tuple(np.round(line_px[0]).astype(int))
-    p2 = tuple(np.round(line_px[1]).astype(int))
-
-    cv2.line(frame, p1, p2, (255, 0, 255), 4)
-    cv2.line(frame, p1, p2, (255, 255, 255), 1)
+    cv2.polylines(frame, [polyline], False, (255, 0, 255), 4, cv2.LINE_AA)
+    cv2.polylines(frame, [polyline], False, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_origin_and_roi_interface_2(
@@ -677,15 +754,14 @@ def draw_interface_2_dashboard(
     points_px_used: np.ndarray,
     points_mm_used: np.ndarray,
     current_method: str,
-    slope: float | None,
-    intercept: float | None,
+    curve_equation: str | None,
     mapper_missing: bool,
     selection_mode: str | None,
     current_camera_index: int | None,
     layout_state: RuntimeSelection | None = None,
 ) -> np.ndarray:
     """
-    Interfaz visual 2 separada:
+    Interfaz visual  separada:
     - Lado izquierdo: solo vista de camara.
     - Lado derecho: panel de controles, metodo activo y estado.
     """
@@ -864,7 +940,7 @@ def draw_interface_2_dashboard(
         2,
     )
     put_fit(
-        "Analisis numerico robusto",
+        "Modelos matematicos de ajuste",
         text_x,
         58,
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -884,10 +960,10 @@ def draw_interface_2_dashboard(
 
     # Estado
     if mapper_missing:
-        status = "Falta origen: usa U y clic"
+        status = "Origen automatico no disponible"
         status_color = (0, 180, 255)
-    elif slope is not None and intercept is not None:
-        status = f"Y = {slope:.3f}X + {intercept:.3f}"
+    elif curve_equation is not None:
+        status = curve_equation
         status_color = (0, 255, 180)
     else:
         status = "Minimo 2 puntos validos"
@@ -937,12 +1013,11 @@ def draw_interface_2_dashboard(
 
     # Controles fijos abajo
     controls = [
-        "U: seleccionar origen",
+        "0,0: automatico abajo izquierda",
         "J: seleccionar ROI",
-        "K: guardar grafica + GRBL",
-        "N: cambiar metodo",
+        "K: guardar trayectoria + GRBL",
+        "N: cambiar modelo",
         "V: cambiar camara",
-        "B: volver interfaz 1",
         "X: salir",
     ]
 
@@ -988,10 +1063,113 @@ def save_regression_plot(
     plt.savefig(output_path, dpi=140)
     plt.close()
 
-
+SECONDARY_METHODS = ("theil_sen", "quadratic", "logarithmic")
 # ============================================================
 # G-CODE PARA GRBL 1.1f
 # ============================================================
+
+def get_unique_finite_points(points_mm: np.ndarray) -> np.ndarray:
+    """
+    Conserva únicamente coordenadas finitas y elimina duplicados exactos.
+    Los puntos permanecen en el mismo sistema absoluto usado por la regresión.
+    """
+    points = np.asarray(points_mm, dtype=np.float64)
+
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("Los puntos deben tener forma Nx2.")
+
+    finite_mask = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    finite_points = points[finite_mask]
+
+    if len(finite_points) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    unique_points: list[tuple[float, float]] = []
+    used: set[tuple[float, float]] = set()
+
+    for x_point, y_point in finite_points:
+        key = (round(float(x_point), 6), round(float(y_point), 6))
+        if key in used:
+            continue
+
+        used.add(key)
+        unique_points.append((float(x_point), float(y_point)))
+
+    return np.asarray(unique_points, dtype=np.float64)
+
+
+def order_points_from_nearest(
+    points_mm: np.ndarray,
+    start_xy: tuple[float, float],
+) -> np.ndarray:
+    """
+    Ordena los puntos comenzando por el más cercano al final de la recta.
+    Solo reduce recorridos en vacío; no modifica ninguna coordenada.
+    """
+    if len(points_mm) <= 1:
+        return points_mm.copy()
+
+    remaining = [point.copy() for point in points_mm]
+    ordered: list[np.ndarray] = []
+    current = np.asarray(start_xy, dtype=np.float64)
+
+    while remaining:
+        distances = [float(np.linalg.norm(point - current)) for point in remaining]
+        nearest_index = int(np.argmin(distances))
+        current = remaining.pop(nearest_index)
+        ordered.append(current)
+
+    return np.asarray(ordered, dtype=np.float64)
+
+
+def append_x_marker_gcode(
+    gcode_lines: list[str],
+    x_center: float,
+    y_center: float,
+    marker_size: float,
+    feed_rate: float,
+    plunge_feed_rate: float,
+    z_safe: float,
+    z_work: float,
+    point_index: int,
+) -> None:
+    """
+    Dibuja una X centrada en una coordenada absoluta.
+
+    G90 fija el centro exacto del punto.
+    G91 se usa únicamente para los desplazamientos pequeños de cada diagonal.
+    Después de cada diagonal se restaura G90 para impedir acumulaciones.
+    """
+    double_size = 2.0 * marker_size
+
+    gcode_lines.extend(
+        [
+            f"; Punto original {point_index}: centro X{x_center:.3f} Y{y_center:.3f}",
+            "G90",
+            f"G0 Z{z_safe:.3f}",
+            f"G0 X{x_center:.3f} Y{y_center:.3f}",
+            "; Primera diagonal de la X",
+            "G91",
+            f"G0 X{-marker_size:.3f} Y{-marker_size:.3f}",
+            "G90",
+            f"G1 Z{z_work:.3f} F{plunge_feed_rate:.1f}",
+            "G91",
+            f"G1 X{double_size:.3f} Y{double_size:.3f} F{feed_rate:.1f}",
+            "G90",
+            f"G0 Z{z_safe:.3f}",
+            f"G0 X{x_center:.3f} Y{y_center:.3f}",
+            "; Segunda diagonal de la X",
+            "G91",
+            f"G0 X{-marker_size:.3f} Y{marker_size:.3f}",
+            "G90",
+            f"G1 Z{z_work:.3f} F{plunge_feed_rate:.1f}",
+            "G91",
+            f"G1 X{double_size:.3f} Y{-double_size:.3f} F{feed_rate:.1f}",
+            "G90",
+            f"G0 Z{z_safe:.3f}",
+        ]
+    )
+
 
 def save_grbl_line_gcode(
     points_mm: np.ndarray,
@@ -1004,14 +1182,28 @@ def save_grbl_line_gcode(
     z_work: float,
     method_label: str,
     return_origin: bool,
+    point_marker_size: float = 1.2,
 ) -> None:
-    if len(points_mm) < 2:
-        raise ValueError("Se requieren al menos 2 puntos validos para generar G-code.")
+    """
+    Genera G-code para dibujar la recta y una X sobre cada punto original usado.
 
-    x_values = points_mm[:, 0].astype(np.float64)
+    La trayectoria principal y los centros de los puntos usan coordenadas
+    absolutas. Los pequeños trazos de cada X usan coordenadas relativas locales.
+    """
+    points_mm_valid = get_unique_finite_points(points_mm)
 
-    # En sector III, max(X) suele ser el punto mas cercano al origen
-    # y min(X) el mas alejado hacia X negativo.
+    if len(points_mm_valid) < 2:
+        raise ValueError("Se requieren al menos 2 puntos válidos para generar G-code.")
+
+    slope = float(slope)
+    intercept = float(intercept)
+
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        raise ValueError("La pendiente o el intercepto no son finitos.")
+
+    marker_size = max(0.05, abs(float(point_marker_size)))
+
+    x_values = points_mm_valid[:, 0]
     x_start = float(np.max(x_values))
     x_end = float(np.min(x_values))
 
@@ -1019,22 +1211,45 @@ def save_grbl_line_gcode(
     y_end = float(slope * x_end + intercept)
 
     if not all(np.isfinite(value) for value in [x_start, y_start, x_end, y_end]):
-        raise ValueError("La recta genero coordenadas no finitas.")
+        raise ValueError("La recta generó coordenadas no finitas.")
+
+    ordered_points = order_points_from_nearest(
+        points_mm=points_mm_valid,
+        start_xy=(x_end, y_end),
+    )
 
     gcode_lines = [
         f"; Generado por app.py - regresion lineal en coordenadas CNC ({method_label})",
         "; Convencion: sector III = X negativo, Y negativo. Z positivo = arriba.",
+        "; Primero se dibuja la recta. Luego se dibuja una X centrada en cada punto original.",
         "G21",       # unidades en mm
         "G90",       # coordenadas absolutas
         "G17",       # plano XY
         "G94",       # avance por minuto
         "G54",       # sistema de coordenadas de trabajo
         f"G0 Z{z_safe:.3f}",
+        "; Trazo de la recta de regresion",
         f"G0 X{x_start:.3f} Y{y_start:.3f}",
         f"G1 Z{z_work:.3f} F{plunge_feed_rate:.1f}",
         f"G1 X{x_end:.3f} Y{y_end:.3f} F{feed_rate:.1f}",
         f"G0 Z{z_safe:.3f}",
+        "; X centradas sobre todos los puntos originales usados",
     ]
+
+    for index, (x_point, y_point) in enumerate(ordered_points, start=1):
+        append_x_marker_gcode(
+            gcode_lines=gcode_lines,
+            x_center=float(x_point),
+            y_center=float(y_point),
+            marker_size=marker_size,
+            feed_rate=feed_rate,
+            plunge_feed_rate=plunge_feed_rate,
+            z_safe=z_safe,
+            z_work=z_work,
+            point_index=index,
+        )
+
+    gcode_lines.append("G90")
 
     if return_origin:
         gcode_lines.append("G0 X0.000 Y0.000")
@@ -1045,11 +1260,141 @@ def save_grbl_line_gcode(
         gcode_file.write("\n".join(gcode_lines) + "\n")
 
 
+def save_curve_plot_interface_2(
+    points_mm: np.ndarray,
+    model: Interface2CurveModel,
+    output_path: str,
+) -> None:
+    """
+    Guarda una grafica del modelo matematico seleccionado en la interfaz 2.
+    """
+    points = _finite_curve_points(points_mm)
+    curve_mm = sample_curve_interface_2(
+        model=model,
+        points_mm=points,
+        sample_count=240,
+    )
+
+    if len(points) < 2 or len(curve_mm) < 2:
+        raise ValueError("No hay suficientes puntos validos para graficar la curva.")
+
+    plt.figure(figsize=(8, 5))
+    plt.scatter(points[:, 0], points[:, 1], color="royalblue", label="Puntos originales")
+    plt.plot(curve_mm[:, 0], curve_mm[:, 1], color="crimson", label=model.equation)
+    plt.axhline(0, color="black", linewidth=0.8, alpha=0.35)
+    plt.axvline(0, color="black", linewidth=0.8, alpha=0.35)
+    plt.xlabel("X maquina (mm)")
+    plt.ylabel("Y maquina (mm)")
+    plt.title(f"Modelo matematico CNC - {model.method}")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.axis("equal")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=140)
+    plt.close()
+
+
+def save_grbl_curve_gcode_interface_2(
+    points_mm: np.ndarray,
+    model: Interface2CurveModel,
+    output_path: str,
+    feed_rate: float,
+    plunge_feed_rate: float,
+    z_safe: float,
+    z_work: float,
+    return_origin: bool,
+    point_marker_size: float = 1.2,
+    curve_samples: int = 90,
+) -> None:
+    """
+    Genera G-code exclusivo para la interfaz 2.
+
+    Primero aproxima el modelo seleccionado mediante segmentos cortos G1.
+    Despues dibuja una X centrada sobre cada punto original utilizado.
+    """
+    points_mm_valid = get_unique_finite_points(points_mm)
+    if len(points_mm_valid) < 2:
+        raise ValueError("Se requieren al menos 2 puntos validos para generar G-code.")
+
+    curve_mm = sample_curve_interface_2(
+        model=model,
+        points_mm=points_mm_valid,
+        sample_count=max(12, int(curve_samples)),
+        reverse=True,
+    )
+
+    if len(curve_mm) < 2:
+        raise ValueError("No se pudo muestrear una trayectoria valida para el modelo seleccionado.")
+
+    marker_size = max(0.05, abs(float(point_marker_size)))
+    x_start, y_start = curve_mm[0]
+    x_end, y_end = curve_mm[-1]
+
+    ordered_points = order_points_from_nearest(
+        points_mm=points_mm_valid,
+        start_xy=(float(x_end), float(y_end)),
+    )
+
+    gcode_lines = [
+        f"; Generado por app.py - modelo matematico CNC ({model.method})",
+        f"; Ecuacion: {model.equation}",
+        "; Primero se dibuja la curva mediante segmentos G1.",
+        "; Luego se dibuja una X centrada en cada punto original.",
+        "G21",
+        "G90",
+        "G17",
+        "G94",
+        "G54",
+        f"G0 Z{z_safe:.3f}",
+        "; Inicio de la curva",
+        f"G0 X{float(x_start):.3f} Y{float(y_start):.3f}",
+        f"G1 Z{z_work:.3f} F{plunge_feed_rate:.1f}",
+    ]
+
+    for x_curve, y_curve in curve_mm[1:]:
+        gcode_lines.append(
+            f"G1 X{float(x_curve):.3f} Y{float(y_curve):.3f} F{feed_rate:.1f}"
+        )
+
+    gcode_lines.extend(
+        [
+            f"G0 Z{z_safe:.3f}",
+            "; X centradas sobre todos los puntos originales usados",
+        ]
+    )
+
+    for index, (x_point, y_point) in enumerate(ordered_points, start=1):
+        append_x_marker_gcode(
+            gcode_lines=gcode_lines,
+            x_center=float(x_point),
+            y_center=float(y_point),
+            marker_size=marker_size,
+            feed_rate=feed_rate,
+            plunge_feed_rate=plunge_feed_rate,
+            z_safe=z_safe,
+            z_work=z_work,
+            point_index=index,
+        )
+
+    gcode_lines.append("G90")
+
+    if return_origin:
+        gcode_lines.append("G0 X0.000 Y0.000")
+
+    gcode_lines.append("M2")
+
+    with open(output_path, "w", encoding="utf-8") as gcode_file:
+        gcode_file.write("\n".join(gcode_lines) + "\n")
+
 # ============================================================
 # SERIAL / GRBL
 # ============================================================
 
 def detect_arduino_serial_port() -> str | None:
+    """
+    Busca un puerto serial compatible con Arduino/GRBL.
+    Si no encuentra una descripcion conocida, usa el primer puerto disponible.
+    """
     if list_ports is None:
         return None
 
@@ -1059,21 +1404,32 @@ def detect_arduino_serial_port() -> str | None:
 
     for port_info in candidates:
         device_text = f"{port_info.device} {port_info.description}".lower()
-        if "arduino" in device_text or "ch340" in device_text or "usb serial" in device_text:
+        if (
+            "arduino" in device_text
+            or "ch340" in device_text
+            or "usb serial" in device_text
+            or "wch" in device_text
+        ):
             return str(port_info.device)
 
     return str(candidates[0].device)
-SECONDARY_METHODS = ("theil_sen", "ransac", "orthogonal")
+
 
 def read_grbl_response(ser: Any, timeout_s: float) -> str | None:
+    """
+    Lee una respuesta no vacia de GRBL hasta que venza el timeout.
+    """
     deadline = time.time() + timeout_s
+
     while time.time() < deadline:
         raw = ser.readline()
         if not raw:
             continue
+
         line = raw.decode("utf-8", errors="ignore").strip()
         if line:
             return line
+
     return None
 
 
@@ -1081,8 +1437,12 @@ def send_gcode_to_grbl(
     gcode_path: str,
     port: str | None,
     baud_rate: int,
-    line_timeout: float = 3.0,
+    line_timeout: float = 22.0,
 ) -> tuple[bool, str]:
+    """
+    Envia el archivo G-code linea por linea y espera la confirmacion `ok`
+    de GRBL antes de continuar con el siguiente comando.
+    """
     if serial is None:
         return False, "Falta pyserial. Instala dependencias con: pip install pyserial"
 
@@ -1092,11 +1452,15 @@ def send_gcode_to_grbl(
 
     try:
         with open(gcode_path, "r", encoding="utf-8") as gcode_file:
-            lines = [line.strip() for line in gcode_file if line.strip() and not line.lstrip().startswith(";")]
+            commands = [
+                line.strip()
+                for line in gcode_file
+                if line.strip() and not line.lstrip().startswith(";")
+            ]
     except OSError as error:
         return False, f"No se pudo leer el archivo G-code: {error}"
 
-    if not lines:
+    if not commands:
         return False, "El archivo G-code esta vacio."
 
     try:
@@ -1105,33 +1469,30 @@ def send_gcode_to_grbl(
             ser.reset_input_buffer()
             ser.reset_output_buffer()
 
+            # Despierta GRBL antes de enviar el archivo.
             ser.write(b"\r\n\r\n")
             time.sleep(0.2)
             ser.reset_input_buffer()
 
-            for command in lines:
+            for command in commands:
                 ser.write((command + "\n").encode("ascii", errors="ignore"))
 
                 response = read_grbl_response(ser, timeout_s=line_timeout)
                 if response is None:
                     return False, f"Timeout esperando respuesta de GRBL tras: {command}"
 
-                if response.lower().startswith("error") or response.lower().startswith("alarm"):
-                    return False, f"GRBL respondio {response} con comando: {command}"
+                while response.lower() != "ok":
+                    if response.lower().startswith("error") or response.lower().startswith("alarm"):
+                        return False, f"GRBL respondio {response} con comando: {command}"
 
-                if response.lower() != "ok":
-                    while response is not None and response.lower() != "ok":
-                        if response.lower().startswith("error") or response.lower().startswith("alarm"):
-                            return False, f"GRBL respondio {response} con comando: {command}"
-                        response = read_grbl_response(ser, timeout_s=line_timeout)
-
+                    response = read_grbl_response(ser, timeout_s=line_timeout)
                     if response is None:
                         return False, f"No llego 'ok' de GRBL tras: {command}"
 
     except serial.SerialException as error:
         return False, f"Error serial en {selected_port}: {error}"
 
-    return True, f"G-code enviado correctamente a GRBL 1.1f por {selected_port}"
+    return True, f"G-code enviado correctamente a GRBL por {selected_port}"
 
 
 # ============================================================
@@ -1257,20 +1618,20 @@ def print_interface_1_instructions() -> None:
 
 
 def print_interface_2_instructions() -> None:
-    print("Controles interfaz :")
-    print("- u: seleccionar origen 0,0  ")
-    print("- j: seleccionar ROI  ")
-    print("- k: guardar grafica, y enviar al cnc")
-    print("- v: cambiar  camara ")
-    print("- n: cambiar metodo de regresion de la interfaz ")
+    print("Controles interfaz 2:")
+    print("- origen 0,0: automatico en la esquina inferior izquierda del ROI")
+    print("- j: seleccionar ROI")
+    print("- k: guardar grafica, generar G-code de trayectoria y enviarlo a la CNC")
+    print("- v: cambiar camara")
+    print("- n: cambiar modelo matematico de la interfaz 2")
+    print("- b: volver a la interfaz 1")
     print("- x: salir")
     print("")
-    print("Metodos disponibles en interfaz :")
-    print("- theil_sen")
-    print("- ransac")
-    print("- orthogonal")
+    print("Modelos matematicos disponibles en interfaz 2:")
+    print("- theil_sen: recta robusta Y = mX + b")
+    print("- quadratic: parabola Y = aX^2 + bX + c")
+    print("- logarithmic: logaritmico Y = a ln(-X) + b")
     print("")
-
 
 
 # ============================================================
@@ -1478,8 +1839,14 @@ def main() -> None:
             print("No se pudo leer un frame de la camara.")
             break
 
+        active_origin_px = (
+            get_interface_2_auto_origin(state.roi, frame.shape)
+            if visual_interface == 2
+            else state.origin_px
+        )
+
         mapper = build_mapper(
-            origin_px=state.origin_px,
+            origin_px=active_origin_px,
             mm_per_pixel_x=mm_per_pixel_x,
             mm_per_pixel_y=mm_per_pixel_y,
             x_positive_right=args.x_positive_right,
@@ -1491,6 +1858,7 @@ def main() -> None:
         points_px_used = np.empty((0, 2), dtype=np.int32)
         points_mm_used = np.empty((0, 2), dtype=np.float64)
         slope = intercept = None
+        curve_model: Interface2CurveModel | None = None
 
         if mapper is not None:
             points_px_used, points_mm_used, _ = select_regression_points(
@@ -1502,15 +1870,13 @@ def main() -> None:
 
             if visual_interface == 1:
                 fit = fit_line(points_mm_used, current_method)
-            else:
-                fit = fit_line_interface_2(points_mm_used, current_secondary_method)
-
-            if fit is not None:
-                slope, intercept = fit
-                if visual_interface == 1:
+                if fit is not None:
+                    slope, intercept = fit
                     draw_regression_line(frame, mapper, slope, intercept, points_mm_used)
-                else:
-                    draw_regression_line_interface_2(frame, mapper, slope, intercept, points_mm_used)
+            else:
+                curve_model = fit_curve_interface_2(points_mm_used, current_secondary_method)
+                if curve_model is not None:
+                    draw_curve_interface_2(frame, mapper, curve_model, points_mm_used)
 
         if visual_interface == 1:
             draw_origin_and_roi(frame, state.origin_px, state.roi)
@@ -1629,14 +1995,13 @@ def main() -> None:
         else:
             frame = draw_interface_2_dashboard(
                 frame=frame,
-                origin_px=state.origin_px,
+                origin_px=active_origin_px,
                 roi=state.roi,
                 points_px=points_px,
                 points_px_used=points_px_used,
                 points_mm_used=points_mm_used,
                 current_method=current_secondary_method,
-                slope=slope,
-                intercept=intercept,
+                curve_equation=curve_model.equation if curve_model is not None else None,
                 mapper_missing=mapper is None,
                 selection_mode=state.mode,
                 current_camera_index=current_camera_index,
@@ -1656,7 +2021,8 @@ def main() -> None:
                 state.mode = None
                 state.roi_first_corner = None
                 clear_console()
-                print("Interfaz visual  activa.")
+                print("Interfaz visual 2 activa.")
+                print("Origen 0,0 automatico: esquina inferior izquierda del ROI.")
                 print_interface_2_instructions()
 
             elif key == ord("g"):
@@ -1689,11 +2055,17 @@ def main() -> None:
                         print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
 
                     try:
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+                        gcode_output_path = args.gcode_output
+                        if not os.path.isabs(gcode_output_path):
+                            gcode_output_path = os.path.join(script_dir, gcode_output_path)
+
                         save_grbl_line_gcode(
                             points_mm=points_mm_used,
                             slope=slope,
                             intercept=intercept,
-                            output_path=args.gcode_output,
+                            output_path=gcode_output_path,
                             feed_rate=max(1.0, args.feed_rate),
                             plunge_feed_rate=max(1.0, args.plunge_feed_rate),
                             z_safe=args.z_safe,
@@ -1701,11 +2073,15 @@ def main() -> None:
                             method_label=current_method,
                             return_origin=args.return_origin,
                         )
-                        print(f"G-code GRBL guardado en {args.gcode_output}")
+
+                        print(
+                            f"G-code GRBL guardado en {gcode_output_path} "
+                            "con recta y puntos originales"
+                        )
 
                         if not args.no_auto_send_grbl:
                             ok, message = send_gcode_to_grbl(
-                                gcode_path=args.gcode_output,
+                                gcode_path=gcode_output_path,
                                 port=args.grbl_port.strip() or None,
                                 baud_rate=max(1200, args.grbl_baud),
                             )
@@ -1769,7 +2145,7 @@ def main() -> None:
         else:
             if key == ord("k"):
                 if mapper is None:
-                    print("Primero debes seleccionar el origen 0,0 con la tecla 'u' en la interfaz .")
+                    print("No se pudo calcular el origen automatico de la interfaz 2.")
                     continue
 
                 points_px_used, points_mm_used, _ = select_regression_points(
@@ -1779,41 +2155,44 @@ def main() -> None:
                     sector_tolerance_mm=args.sector_tolerance_mm,
                 )
 
-                fit = fit_line_interface_2(points_mm_used, current_secondary_method)
-                if fit is not None:
-                    slope, intercept = fit
-
-                    save_regression_plot(
-                        points_mm=points_mm_used,
-                        slope=slope,
-                        intercept=intercept,
-                        output_path="regression_plot_interface_2.png",
-                        method_label=current_secondary_method,
-                    )
-                    print("Grafica guardada en regression_plot_interface_2.png")
-                    print(f"Regresion CNC interfaz : Y = {slope:.6f}X + {intercept:.6f}")
-                    print("Puntos usados en mm:")
-                    for x_mm, y_mm in points_mm_used:
-                        print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
+                curve_model = fit_curve_interface_2(points_mm_used, current_secondary_method)
+                if curve_model is not None:
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    plot_output_path = os.path.join(script_dir, "regression_plot_interface_2.png")
+                    gcode_output_path = args.gcode_output
+                    if not os.path.isabs(gcode_output_path):
+                        gcode_output_path = os.path.join(script_dir, gcode_output_path)
 
                     try:
-                        save_grbl_line_gcode(
+                        save_curve_plot_interface_2(
                             points_mm=points_mm_used,
-                            slope=slope,
-                            intercept=intercept,
-                            output_path=args.gcode_output,
+                            model=curve_model,
+                            output_path=plot_output_path,
+                        )
+                        print(f"Grafica guardada en {plot_output_path}")
+                        print(f"Modelo CNC interfaz  ({curve_model.method}): {curve_model.equation}")
+                        print("Puntos usados en mm:")
+                        for x_mm, y_mm in points_mm_used:
+                            print(f"  X={x_mm:.3f}, Y={y_mm:.3f}")
+
+                        save_grbl_curve_gcode_interface_2(
+                            points_mm=points_mm_used,
+                            model=curve_model,
+                            output_path=gcode_output_path,
                             feed_rate=max(1.0, args.feed_rate),
                             plunge_feed_rate=max(1.0, args.plunge_feed_rate),
                             z_safe=args.z_safe,
                             z_work=args.z_work,
-                            method_label=current_secondary_method,
                             return_origin=args.return_origin,
                         )
-                        print(f"G-code GRBL guardado en {args.gcode_output}")
+                        print(
+                            f"G-code GRBL guardado en {gcode_output_path} "
+                            f"con trayectoria {curve_model.method} y puntos originales"
+                        )
 
                         if not args.no_auto_send_grbl:
                             ok, message = send_gcode_to_grbl(
-                                gcode_path=args.gcode_output,
+                                gcode_path=gcode_output_path,
                                 port=args.grbl_port.strip() or None,
                                 baud_rate=max(1200, args.grbl_baud),
                             )
@@ -1822,15 +2201,16 @@ def main() -> None:
                             print("Envio automatico desactivado por --no-auto-send-grbl")
 
                     except ValueError as error:
-                        print(f"No se pudo generar G-code: {error}")
+                        print(f"No se pudo generar la trayectoria o el G-code: {error}")
                 else:
-                    print("No se pudo calcular una regresion estable con los puntos actuales en interfaz .")
-                    print("Verifica que haya al menos 2 puntos rojos dentro del ROI y en sector III.")
-
-            elif key == ord("u"):
-                state.mode = "origin"
-                state.roi_first_corner = None
-                print("Interfaz : haz clic sobre el punto que representa X0 Y0.")
+                    print(
+                        "No se pudo calcular el modelo matematico seleccionado "
+                        f"({current_secondary_method})."
+                    )
+                    print(
+                        "Verifica los puntos del ROI. La parabola requiere minimo 3 puntos; "
+                        "los modelos logaritmico y exponencial requieren minimo 2."
+                    )
 
             elif key == ord("j"):
                 state.mode = "roi"
